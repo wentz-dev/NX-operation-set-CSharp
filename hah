@@ -1,0 +1,1233 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using System.Windows.Forms;
+using GetModelNum;
+using NetTopologySuite.Geometries;
+using NX85.Entity;
+using NX85.Function;
+using NXOpen;
+
+namespace NX85
+{
+    /*******************************************************
+     *** 名    称：分块主逻辑
+     *** 简    介：
+     *** 作    者：刘文志（20241785）
+     *** 创建时间：2024/7/9 8:49:22
+     *** 版本信息：v1.0.0
+     *** 版权所有：©2024 豪迈集团股份有限公司 保留所有权利.
+	 * ------------------------------------------------------
+	 * ** 修改人员：
+	 * ** 修改时间：
+	 * ** 修改内容：
+	 *******************************************************/
+
+    public class BusinessLogic4Segment
+    {
+        private static double radius = 0;
+        private static double width = 0;
+
+        /// <summary>
+        /// 花纹顶面图层
+        /// </summary>
+        private const int TOPFACELAYER = 4;
+        /// <summary>
+        /// 插件工作图层
+        /// </summary>
+        private const int WORKLAYER = 250;
+        /// <summary>
+        /// 辅助物存放图层
+        /// </summary>
+        private const int OTHERLAYER = 256;
+
+        /// <summary>
+        /// 主逻辑
+        /// </summary>
+        /// <returns></returns>
+		public static bool MainLogic(List<CustomLine> customLines, List<SegmentInfo> segmentInfos)
+        {
+            //用户窗体
+            NX85.View.UserForm4Seg instance = NX85.View.UserForm4Seg.instance;
+
+            //有一点用的数
+            radius = width = 0;
+
+            //分块个数
+            int segNum = segmentInfos.Count;
+
+            //切换工作图层
+            UGFunc.GetWorkPart();
+            UGFunc.ChangeLayerState(NXOpen.Layer.State.WorkLayer, WORKLAYER);
+            UGFunc.ChangeLayerState(NXOpen.Layer.State.Hidden, instance.GetMoldLayer(), TOPFACELAYER, OTHERLAYER);
+
+            #region 准备裁剪工具
+            //起连结作用的第三条弧线
+            Arc[] thirdCurves = new Arc[segNum];
+
+            Log.Info("Step1: 连结相邻分型线");
+            try
+            {
+                for (int i = 0; i < segNum; i++)
+                {
+                    double startAngle = MathFunc.GetDegreeToYAxisInYZPlane(segmentInfos[i].StartLine.Vertex);
+                    double endAngle = MathFunc.GetDegreeToYAxisInYZPlane(segmentInfos[i].EndLine.Vertex);
+                    if (instance.IsClockWise())
+                    {
+                        double temp = startAngle;
+                        startAngle = endAngle;
+                        endAngle = temp;
+                    }
+                    Point3d centerPt = new Point3d(0, 0, 0);
+                    double arcRadius = MathFunc.GetDistanceToOrigin(segmentInfos[i].StartLine.Vertex);
+                    thirdCurves[i] = UGFunc.CreateArc(centerPt, arcRadius, startAngle, endAngle);
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex.ToString());
+                MessageBox.Show("无法连结相邻分块线\n" + ex.Message);
+                return false;
+            }
+            finally
+            {
+                UGFunc.theUFSession.Disp.Refresh();
+                //Program.theProgram.theForm.SetProcessBar(5);
+            }
+
+
+            //裁剪工具块
+            Body[] trimBlocks = new Body[segNum];
+            Body[] patternBlocks = new Body[segNum];
+
+            Log.Info("Step2: 构建裁剪工具块");
+            try
+            {
+                for (int i = 0; i < segNum; i++)
+                {
+                    Curve[] curves = { preSegmentList[i].StartLine.Line, preSegmentList[i].EndLine.Line, thirdCurves[i] };
+                    trimBlocks[i] = UGFunc.CreateExtrude(curves, 1000, -1000);
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex.ToString());
+                MessageBox.Show("构建裁剪工具块时出现异常\n" + ex.Message);
+                return false;
+            }
+            finally
+            {
+                UGFunc.theUFSession.Disp.Refresh();
+                //Program.theProgram.theForm.SetProcessBar(10);
+            }
+            #endregion
+
+            #region 分模
+            //造型中包含的Body
+            Body[] bodiesOfMold = UGFunc.GetObjectInLayer<Body>(moldLayer);
+            //造型中包含的Curve
+            Curve[] curvesOfMold = UGFunc.GetObjectInLayer<Curve>(moldLayer);
+            //分割完每个块中包含的Body
+            List<Body>[] bodiesOfSeg = new List<Body>[segNum];
+
+            Log.Info("Step3: 分割模型");
+
+            #region 布尔操作交集
+
+            //try
+            //{
+            //    for (int i = 0; i < segNum; i++)
+            //    {
+            //        bodiesOfSeg[i] = new List<Body>();
+            //        for (int j = 0; j < bodiesOfMold.Length; j++)
+            //        {
+            //            bool intersectant = IsIntersectant(trimBlocks[i], bodiesOfMold[j])
+            //                && UGFunc.GetMiniDistance(trimBlocks[i], bodiesOfMold[j]) <= 1e-5;
+            //            if (intersectant == false) { continue; }
+            //            try
+            //            {
+            //                Body[] intersectObjs =
+            //                    UGFunc.BoolOperateIntersect(bodiesOfMold[j], trimBlocks[i]);
+            //                bodiesOfSeg[i].AddRange(intersectObjs);
+            //            }
+            //            catch (Exception ex)
+            //            {
+            //                //此处无需写入Error日志
+            //                Log.Info(ex.Message);
+            //            }
+            //        }
+            //    }
+            //}
+            //catch (Exception ex)
+            //{
+            //    Log.Error(ex.ToString());
+            //    MessageBox.Show("分割模型时出现异常\n" + ex.Message);
+            //    return false;
+            //}
+            #endregion
+            #region 简单干涉
+            int outsideErrNum = 0;
+            try
+            {
+                for (int i = 0; i < segNum; i++)
+                {
+                    bodiesOfSeg[i] = new List<Body>();
+                    for (int j = 0; j < bodiesOfMold.Length; j++)
+                    {
+                        UGFunc.SimpleInterference(trimBlocks[i], bodiesOfMold[j], out int flag, out NXObject[] objects);
+                        if (flag == 2)
+                        {
+                            for (int k = 0; k < objects.Length; k++)
+                            {
+                                bodiesOfSeg[i].Add(objects[k] as Body);
+                            }
+                        }
+                        else if (IsIntersectant(trimBlocks[i], bodiesOfMold[j]))
+                        {
+                            try
+                            {
+                                Body[] intersectObjs =
+                                    UGFunc.BoolOperateIntersect(bodiesOfMold[j], trimBlocks[i]);
+                                bodiesOfSeg[i].AddRange(intersectObjs);
+                            }
+                            catch (Exception ex)
+                            {
+                                //此处无需写入Error日志
+                                if (ex.Message == "工具体完全在目标体外。")
+                                {
+                                    outsideErrNum += 1;
+                                }
+                                else
+                                {
+                                    Log.Info(ex.Message);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex.ToString());
+                MessageBox.Show("分割模型时出现异常\n" + ex.Message);
+                return false;
+            }
+            if (outsideErrNum > 0)
+            {
+                Log.Info("工具体完全在目标体外 x " + outsideErrNum.ToString());
+            }
+            #endregion
+            UGFunc.theUFSession.Disp.Refresh();
+            Program.theProgram.theForm.SetProcessBar(30);
+
+            //气孔曲线
+            List<Curve>[] holeCurves = new List<Curve>[segNum];
+            //其它曲线
+            List<Curve>[] otherCurves = new List<Curve>[segNum];
+
+            Log.Info("Step4: 分拣曲线");
+            try
+            {
+                for (int i = 0; i < segNum; i++)
+                {
+                    holeCurves[i] = new List<Curve>();
+                    otherCurves[i] = new List<Curve>();
+                }
+
+                for (int j = 0; j < curvesOfMold.Length; j++)
+                {
+                    UGFunc.ArcFitting(curvesOfMold[j].Tag, out double[] centerPt, out double radius);
+                    for (int i = 0; i < segNum; i++)
+                    {
+                        double angle_1 = preSegmentList[i].StartLine.Angle - firstCustomLine.Angle;
+                        angle_1 = angle_1 < 0 ? angle_1 + 360 : angle_1;
+                        double angle_2 = preSegmentList[i].EndLine.Angle - firstCustomLine.Angle;
+                        angle_2 = angle_2 < 0 ? angle_2 + 360 : angle_2;
+
+                        bool included = IsIntersectant4Curve(centerPt, firstCustomLine.Angle, angle_1, angle_2, isClockWise);
+                        if (included)
+                        {
+                            double[] startPoint = UGFunc.GetCurvePt(curvesOfMold[j].Tag, 0);
+                            double[] endPoint = UGFunc.GetCurvePt(curvesOfMold[j].Tag, 1);
+                            //起点与终点是同一个点
+                            if (Math.Abs(startPoint[0] - endPoint[0]) < 1e-5
+                                && Math.Abs(startPoint[1] - endPoint[1]) < 1e-5
+                                && Math.Abs(startPoint[2] - endPoint[2]) < 1e-5)
+                            {
+                                holeCurves[i].Add(curvesOfMold[j]);
+                            }
+                            else
+                            {
+                                otherCurves[i].Add(curvesOfMold[j]);
+                            }
+                        }
+
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex.ToString());
+                MessageBox.Show("分拣曲线时出现异常\n" + ex.Message);
+                return false;
+            }
+            UGFunc.theUFSession.Disp.Refresh();
+            Program.theProgram.theForm.SetProcessBar(35);
+            #endregion
+
+            #region 清理"垃圾"
+            Log.Info("清理一处垃圾");
+            try
+            {
+                List<NXObject> tempList = new List<NXObject>();
+                for (int i = 0; i < segNum; i++)
+                {
+                    if (bodiesOfSeg[i] != null && bodiesOfSeg[i].Count > 0)
+                    {
+                        tempList.AddRange(bodiesOfSeg[i]);
+                    }
+                }
+                if (tempList.Count > 0)
+                {
+                    UGFunc.RemoveParameters(tempList.ToArray());
+                }
+                tempList.Clear();
+                tempList.AddRange(thirdCurves);
+                tempList.AddRange(trimBlocks);
+                UGFunc.MoveObjsToLayer(256, "fuzhutusu", tempList.ToArray());
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex.ToString());
+                MessageBox.Show("清理一处辅助物时出现异常\n" + ex.Message);
+                return false;
+            }
+            UGFunc.theUFSession.Disp.Refresh();
+            Program.theProgram.theForm.SetProcessBar(40);
+            #endregion
+
+            #region 填充"窟窿"
+            //侧面补充失败的块
+            List<string> failureNum = new List<string>();
+            //侧面辅助物
+            List<Body> sideHelperList = new List<Body>();
+            //侧面
+            List<Body>[] sideList = new List<Body>[segNum];
+
+            Log.Info("Step5：补充侧面");
+            try
+            {
+                for (int i = 0; i < segNum; i++)
+                {
+                    Body startSide = (Body)UGFunc.CreateExtrude(new Curve[] { preSegmentList[i].StartLine.Line }, -1000, 1000);
+                    sideHelperList.Add(startSide);
+                    Body endSide = (Body)UGFunc.CreateExtrude(new Curve[] { preSegmentList[i].EndLine.Line }, -1000, 1000);
+                    sideHelperList.Add(endSide);
+                    sideList[i] = new List<Body>();
+                    Session.UndoMarkId undo = 0;
+                    try
+                    {
+                        undo = UGFunc.theSession.SetUndoMark(Session.MarkVisibility.Visible, "修剪片体");
+                        Body[] bodies = UGFunc.CreateTrimSheet(startSide, bodiesOfSeg[i].ToArray(), tolerance);
+                        sideList[i].AddRange(bodies);
+                    }
+                    catch (Exception ex)
+                    {
+                        UGFunc.theSession.UndoToMark(undo, null);
+                        failureNum.Add(isCharName ? MathFunc.ConvertDecimalToLetters(i + 1) : (i + 1).ToString());
+                        Log.Info(ex.Message);
+                    }
+                    finally
+                    {
+                        UGFunc.theSession.DeleteUndoMark(undo, null);
+                    }
+
+                    try
+                    {
+                        undo = UGFunc.theSession.SetUndoMark(Session.MarkVisibility.Visible, "修剪片体");
+                        Body[] bodies = UGFunc.CreateTrimSheet(endSide, bodiesOfSeg[i].ToArray(), tolerance);
+                        sideList[i].AddRange(bodies);
+                    }
+                    catch (Exception ex)
+                    {
+                        UGFunc.theSession.UndoToMark(undo, null);
+                        failureNum.Add(isCharName ? MathFunc.ConvertDecimalToLetters(i + 1) : (i + 1).ToString());
+                        Log.Info(ex.Message);
+                    }
+                    finally
+                    {
+                        UGFunc.theSession.DeleteUndoMark(undo, null);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex.ToString());
+                MessageBox.Show("补充侧面时出现异常\n" + ex.Message);
+                return false;
+            }
+            UGFunc.theUFSession.Disp.Refresh();
+            Program.theProgram.theForm.SetProcessBar(50);
+            #endregion
+
+            #region 清理"垃圾"
+            Log.Info("清理二处垃圾");
+            try
+            {
+                List<NXObject> tempList = new List<NXObject>();
+                for (int i = 0; i < segNum; i++)
+                {
+                    tempList.AddRange(sideList[i]);
+                }
+                if (tempList.Count > 0)
+                {
+                    UGFunc.RemoveParameters(tempList.ToArray());
+                }
+                tempList.Clear();
+                UGFunc.MoveObjsToLayer(256, "fuzhutusu", sideHelperList.ToArray());
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex.ToString());
+                MessageBox.Show("清理二处辅助物时出现异常\n" + ex.Message);
+                return false;
+            }
+            UGFunc.theUFSession.Disp.Refresh();
+            Program.theProgram.theForm.SetProcessBar(55);
+            #endregion
+
+            #region 气孔标识
+            Body topFace = null, frontFace = null;
+            Curve sectionLine = null;
+            double length = 0, offset = 0;
+
+            Log.Info("Step6：生成气孔标识线");
+            try
+            {
+                topFace = UGFunc.GetObjectInLayer<Body>(4)[0];
+                frontFace = UGFunc.CreateExtrude(new Curve[] { frontCustomLine.Line }, -1000, 1000);
+                sectionLine = UGFunc.CreateIntersectionCurve(topFace, frontFace);
+                UGFunc.RemoveParameters(sectionLine);
+                UGFunc.MoveObjectsByAngle(new NXObject[] { sectionLine }, -90, 0);
+                length = UGFunc.GetBoundingBoxExact(sectionLine.Tag)[4];
+                offset = MathFunc.GetAxisPositiveAngle(length, holeRange);
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex.ToString());
+                MessageBox.Show("生成气孔标识线时出现异常\n" + ex.Message);
+            }
+
+            //气孔标识线
+            List<Curve>[] holeMarkLines = new List<Curve>[segNum];
+            try
+            {
+                for (int i = 0; i < segNum; i++)
+                {
+                    Curve startSLCopy = (Curve)UGFunc.TransformObjects(new NXObject[] { sectionLine }, new double[] { 0, 0, 0 }, true, -1)[0];
+                    Curve endSLCopy = (Curve)UGFunc.TransformObjects(new NXObject[] { sectionLine }, new double[] { 0, 0, 0 }, true, -1)[0];
+                    if (isClockWise)
+                    {
+                        if (Math.Abs(preSegmentList[i].StartLine.Angle - offset) > 1e-5)
+                        {
+                            UGFunc.MoveObjectsByAngle(new NXObject[] { startSLCopy }, preSegmentList[i].StartLine.Angle - offset, 0);
+                        }
+                        if (Math.Abs(preSegmentList[i].EndLine.Angle + offset) > 1e-5)
+                        {
+                            UGFunc.MoveObjectsByAngle(new NXObject[] { endSLCopy }, preSegmentList[i].EndLine.Angle + offset, 0);
+                        }
+                    }
+                    else
+                    {
+                        if (Math.Abs(preSegmentList[i].StartLine.Angle + offset) > 1e-5)
+                        {
+                            UGFunc.MoveObjectsByAngle(new NXObject[] { startSLCopy }, preSegmentList[i].StartLine.Angle + offset, 0);
+                        }
+                        if (Math.Abs(preSegmentList[i].EndLine.Angle - offset) > 1e-5)
+                        {
+                            UGFunc.MoveObjectsByAngle(new NXObject[] { endSLCopy }, preSegmentList[i].EndLine.Angle - offset, 0);
+                        }
+                    }
+                    holeMarkLines[i] = new List<Curve>(2)
+                    {
+                        startSLCopy,
+                        endSLCopy
+                    };
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex.ToString());
+                MessageBox.Show("生成气孔标识线时出现异常\n" + ex.Message);
+                return false;
+            }
+
+            Log.Info("Step7：进行气孔标识");
+            try
+            {
+                if (sectionLine != null)
+                {
+                    List<IdentifyRange> ranges = new List<IdentifyRange>();
+                    for (int i = 0; i < segNum; i++)
+                    {
+                        double temp = MathFunc.GetAxisPositiveAngle(customLineList[i].vertex.Y, customLineList[i].vertex.Z);
+                        double one = temp - offset;
+                        if (one < 0)
+                        {
+                            ranges.Add(new IdentifyRange(one + 360, 360));
+                            ranges.Add(new IdentifyRange(0, temp));
+                        }
+                        else
+                        {
+                            ranges.Add(new IdentifyRange(one, temp));
+                        }
+                        double two = temp + offset;
+                        if (two > 360)
+                        {
+                            ranges.Add(new IdentifyRange(temp, 360));
+                            ranges.Add(new IdentifyRange(0, two - 360));
+                        }
+                        else
+                        {
+                            ranges.Add(new IdentifyRange(temp, two));
+                        }
+                    }
+
+                    for (int i = 0; i < segNum; i++)
+                    {
+                        holeCurves[i] = UGFunc.TransformObjects(holeCurves[i].ToArray(), new double[] { 0, 0, 0 }, true, -1)
+                            .Select(o => o as Curve).ToList();
+                        List<DisplayableObject> list = new List<DisplayableObject>();
+                        foreach (NXObject hole in holeCurves[i])
+                        {
+                            UGFunc.ArcFitting(hole.Tag, out double[] centerPt, out double cRadius);
+                            double holeAngle = MathFunc.GetAxisPositiveAngle(centerPt[1], centerPt[2]);
+                            for (int k = 0; k < ranges.Count; k++)
+                            {
+                                if (holeAngle >= ranges[k].low && holeAngle <= ranges[k].high)
+                                {
+                                    list.Add((DisplayableObject)hole);
+                                    break;
+                                }
+                            }
+                        }
+                        if (list.Count > 0)
+                        {
+                            UGFunc.ChangeColor(list.ToArray(), 186);
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex.ToString());
+                MessageBox.Show("标识气孔时出现异常\n" + ex.Message);
+                return false;
+            }
+            UGFunc.theUFSession.Disp.Refresh();
+            Program.theProgram.theForm.SetProcessBar(65);
+            #endregion
+
+            #region 清理"垃圾"
+            Log.Info("清理三处垃圾");
+            try
+            {
+                List<NXObject> tempList = new List<NXObject>();
+                tempList.Add(sectionLine);
+                tempList.Add(frontFace);
+                tempList = tempList.Where(o => o != null).ToList();
+                if (tempList.Count > 0)
+                {
+                    UGFunc.MoveObjsToLayer(256, "fuzhutusu", tempList.ToArray());
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex.ToString());
+                MessageBox.Show("清理三处辅助物时出现异常\n" + ex.Message);
+                return false;
+            }
+            UGFunc.theUFSession.Disp.Refresh();
+            Program.theProgram.theForm.SetProcessBar(70);
+            #endregion
+
+            #region 周向移动分块
+            Log.Info("计算移动角度");
+            double[] rotateAngles = new double[segNum];
+            try
+            {
+
+                if (moveFront)
+                {
+                    for (int i = 0; i < segNum; i++)
+                    {
+                        if (isClockWise)
+                        {
+                            double angle_1 = preSegmentList[i].StartLine.AngleZ - frontCustomLine.AngleZ;
+                            double angle_2 = preSegmentList[i].EndLine.AngleZ - frontCustomLine.AngleZ;
+                            rotateAngles[i] = (angle_1 + angle_2 + (angle_1 < angle_2 ? 360 : 0)) / 2;
+                        }
+                        else
+                        {
+                            double angle_1 = preSegmentList[i].StartLine.angle - frontCustomLine.angle;
+                            double angle_2 = preSegmentList[i].EndLine.angle - frontCustomLine.angle;
+                            rotateAngles[i] = (angle_1 + angle_2 + (angle_1 > angle_2 ? 360 : 0)) / 2;
+                        }
+                    }
+                }
+
+                if (moveCenter)
+                {
+                    double distAngle = 360.0 / segNum;
+                    for (int i = 0; i < segNum; i++)
+                    {
+                        if (isClockWise)
+                        {
+                            double angle_1 = blockStartAngle - +distAngle * i;
+                            double angle_2 = blockStartAngle + distAngle * (i + 1);
+
+                        }
+                        else
+                        {
+                            rotateAngles[i] = rotateAngles[i] - blockStartAngle - (2 * i + 1) * (distAngle / 2);
+                        }
+                    }
+                }
+
+                //if (moveCenter == false && moveFront == false)
+                //{
+                //    for (int i = 0; i < segNum; i++)
+                //    {
+                //        rotateAngles[i] = 0;
+                //    }
+                //}
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex.ToString());
+            }
+
+            Log.Info("Step8：周向移动分块");
+            try
+            {
+                for (int i = 0; i < segNum; i++)
+                {
+                    while (!(rotateAngles[i] >= 0 && rotateAngles[i] < 360))
+                    {
+                        if (rotateAngles[i] < 0)
+                        {
+                            rotateAngles[i] += 360;
+                        }
+                        else if (rotateAngles[i] >= 360)
+                        {
+                            rotateAngles[i] -= 360;
+                        }
+                    }
+
+                    if (Math.Abs(rotateAngles[i] - 0) > 1e-5 && Math.Abs(rotateAngles[i] - 360) > 1e-5)
+                    {
+                        List<NXObject> moveObjs = new List<NXObject>();
+                        moveObjs.AddRange(bodiesOfSeg[i]);
+                        moveObjs.AddRange(sideList[i]);
+                        moveObjs.AddRange(holeCurves[i]);
+                        moveObjs.AddRange(holeMarkLines[i]);
+                        UGFunc.MoveObjectsByAngle(moveObjs.ToArray(), -rotateAngles[i], 0);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex.ToString());
+                MessageBox.Show("周向移动分块时出现异常\n" + ex.Message);
+            }
+            UGFunc.theUFSession.Disp.Refresh();
+            Program.theProgram.theForm.SetProcessBar(80);
+            #endregion
+
+            #region 标注
+            Log.Info("Step9：添加块文字标注");
+            List<NXObject>[] texts = new List<NXObject>[segNum];
+            try
+            {
+                for (int i = 0; i < segNum; i++)
+                {
+                    //标注
+                    NXObject[] texts_1 = UGFunc.GetObjectInLayer<NXObject>();
+                    UGFunc.CreateText("下模" + (isCharName ? MathFunc.ConvertDecimalToLetters(i + 1) : (i + 1).ToString()), width, 0, radius);
+                    NXObject[] texts_2 = UGFunc.GetObjectInLayer<NXObject>();
+                    texts[i] = new List<NXObject>();
+                    texts[i].AddRange(UGFunc.FindNewObj(texts_1, texts_2));
+                }
+
+                UGFunc.RemoveParameters(texts.SelectMany(o => o.ToArray()).ToArray());
+
+                for (int i = 0; i < segNum; i++)
+                {
+                    if (texts[i] != null && texts[i].Count > 0)
+                    {
+                        //segmentObjs[i].AddRange(texts[i].ToArray());
+                        UGFunc.SetColor_UF(texts[i].ToArray(), 36);
+                        if (markPosLeft)
+                        {
+
+                        }
+                        else
+                        {
+                            UGFunc.MoveObjectsByAngle(texts[i].ToArray(), 180, 0, 0.0, 0.0, 1.0);
+                        }
+
+                        //if (moveFront)
+                        //{
+                        //}
+                        //else if (moveCenter)
+                        //{
+                        //    double temp = blockStartAngle + (2 * i + 1) * (360.0 / (segNum * 2));
+                        //    temp %= 360;
+                        //    if (Math.Abs(temp - 0) > 1e-5 && Math.Abs(temp - 360) > 1e-5)
+                        //    {
+                        //        UGFunc.MoveObjectsByAngle(texts[i].ToArray(), isClockWise ? -temp : temp, 0);
+                        //    }
+                        //}
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex.ToString());
+                MessageBox.Show("添加块文字标注时出现异常\n" + ex.Message);
+                return false;
+            }
+            Program.theProgram.theForm.SetProcessBar(90);
+            #endregion
+
+            #region 统计分块信息
+            Log.Info("Step10：统计分块信息");
+            try
+            {
+                if (moveCenter)
+                {
+                    string otherInfo = "侧面补充失败：" +
+                        (failureNum.Count > 0 ? string.Join(", ", failureNum.Distinct().ToArray()).ToString() : "无");
+                    StatisticsTwo(segNum, statDirectory, isCharName, otherInfo);
+                }
+                else
+                {
+
+                    Body tempBody1 = UGFunc.CreateExtrude(new Curve[] { frontCustomLine.Line }, -1000, 0);
+                    Body tempBody2 = UGFunc.CreateExtrude(new Curve[] { frontCustomLine.Line }, 0, 1000);
+                    List<double> angleList = new List<double>();
+                    for (int i = 0; i < preSegmentList.Count; i++)
+                    {
+                        angleList.Add(preSegmentList[i].Angle);
+                    }
+
+                    List<NXObject>[] list = new List<NXObject>[segNum];
+                    for (int i = 0; i < segNum; i++)
+                    {
+                        list[i] = new List<NXObject>();
+                        list[i].AddRange(bodiesOfSeg[i]);
+                        list[i].AddRange(sideList[i]);
+                    }
+                    string otherInfo = "侧面补充失败：" +
+                        (failureNum.Count > 0 ? string.Join(", ", failureNum.Distinct().ToArray()).ToString() : "无");
+                    StatisticsOne(list, angleList.ToArray(), holeCurves, statDirectory, isCharName, tempBody1, tempBody2,
+                        otherInfo, compareHole, 1);
+                    UGFunc.Delete(new NXObject[] { tempBody1, tempBody2 });
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex.ToString());
+                MessageBox.Show("统计分块信息时出现异常\n" + ex.Message);
+            }
+            Program.theProgram.theForm.SetProcessBar(95);
+            #endregion
+
+            #region 移动分块
+            Log.Info("Step11：移动分块至指定图层");
+            try
+            {
+                int segLayerID = trimLayer;
+                for (int i = 0; i < segNum; i++)
+                {
+                    string cname = string.Format("Seg{0}", isCharName ? MathFunc.ConvertDecimalToLetters(i + 1) : (i + 1).ToString());
+
+                    List<NXObject> list = new List<NXObject>();
+                    list.AddRange(bodiesOfSeg[i]);
+                    list.AddRange(sideList[i]);
+                    list.AddRange(holeCurves[i]);
+                    list.AddRange(texts[i]);
+                    list.AddRange(holeMarkLines[i]);
+                    UGFunc.MoveObjsToLayer(segLayerID, cname, list.ToArray());
+
+                    segLayerID++;
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex.ToString());
+                MessageBox.Show("移动分块至图层时出现异常\n" + ex.Message);
+            }
+            Program.theProgram.theForm.SetProcessBar(99);
+            #endregion
+
+            #region 其它
+            if (!(saveDirctory is null || "".Equals(saveDirctory)))
+            {
+                Log.Info("Step12：另存为");
+                for (int i = 0; i < segNum; i++)
+                {
+                    List<Tag> saveObjTag = new List<Tag>();
+                    for (int j = 0; j < bodiesOfSeg[i].Count; j++)
+                    {
+                        saveObjTag.Add(bodiesOfSeg[i][j].Tag);
+                    }
+                    for (int j = 0; j < sideList[i].Count; j++)
+                    {
+                        saveObjTag.Add(sideList[i][j].Tag);
+                    }
+                    for (int j = 0; j < holeCurves[i].Count; j++)
+                    {
+                        saveObjTag.Add(holeCurves[i][j].Tag);
+                    }
+                    for (int j = 0; j < texts[i].Count; j++)
+                    {
+                        saveObjTag.Add(texts[i][j].Tag);
+                    }
+                    for (int j = 0; j < holeMarkLines[i].Count; j++)
+                    {
+                        saveObjTag.Add(holeMarkLines[i][j].Tag);
+                    }
+                    string filePath = string.Format("{0}\\Seg{1}", saveDirctory, isCharName ? MathFunc.ConvertDecimalToLetters(i + 1) : (i + 1).ToString());
+
+                    try
+                    {
+                        if (File.Exists(filePath + ".prt"))
+                        {
+                            File.Delete(filePath + ".prt");
+                        }
+                        UGFunc.Export(filePath, saveObjTag.ToArray());
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.Error("另存为时出错了：\n" + ex.ToString());
+                        MessageBox.Show("另存为时出错了：\n" + ex.Message);
+                    }
+                }
+
+            }
+
+            if (isShutdown)
+            {
+                Log.Info("Step13：关机");
+                try
+                {
+                    NXOpen.Session.GetSession().Parts.Work.Save(NXOpen.BasePart.SaveComponents.True, BasePart.CloseAfterSave.True);
+                }
+                catch (Exception ex)
+                {
+                    Log.Error("关机时出错了:\n" + ex.ToString());
+                    MessageBox.Show("关机时出错了:\n" + ex.Message);
+                }
+            }
+            Program.theProgram.theForm.SetProcessBar(100);
+            #endregion
+            return true;
+        }
+
+        /// <summary>
+        /// 测试用
+        /// </summary>
+        public static void SegmentMain()
+        {
+            TaggedObject[] taggedObjects = UGFunc.SelectObjects("", Selection.SelectionType.All);
+            UGFunc.CreateBlock(taggedObjects[0].Tag);
+        }
+
+        /// <summary>
+        /// 判断曲线与实体的相交性
+        /// </summary>
+        /// <param name="point"></param>
+        /// <param name="refAngle"></param>
+        /// <param name="angle_1"></param>
+        /// <param name="angle_2"></param>
+        /// <param name="isClockWise"></param>
+        /// <returns></returns>
+        public static bool IsIntersectant4Curve(double[] point, double refAngle, double angle_1, double angle_2, bool isClockWise)
+        {
+            //Log.Info("判断相交性");
+            double angle = MathFunc.GetAxisPositiveAngle(point[1], point[2]) - refAngle;
+            angle = angle < 0 ? angle + 360 : angle;
+            double temp = 0;
+            if (isClockWise)
+            {
+                //顺时针分块的第一块
+                if (angle_1 < angle_2)
+                {
+                    temp = 360;
+                }
+                if (angle >= angle_2 && angle <= angle_1 + temp)
+                {
+                    return true;
+                }
+            }
+            else
+            {
+                //逆时针分块的最后一块
+                if (angle_1 > angle_2)
+                {
+                    temp = 360;
+                }
+                if (angle >= angle_1 && angle <= angle_2 + temp)
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// 统计分块
+        /// </summary>
+        /// <param name="segNum"></param>
+        /// <param name="statDirectory"></param>
+        /// <param name="isCharName"></param>
+        private static void StatisticsTwo(int segNum, string statDirectory, bool isCharName, string otherInfo)
+        {
+            Log.Info("统计分块");
+
+            string str = "";
+            str += string.Format("[{0}]\n花纹块共{1}块，分{2}种情况:\n", DateTime.Now, segNum, segNum);
+            for (int i = 0; i < segNum; i++)
+            {
+                str += isCharName ? MathFunc.ConvertDecimalToLetters(i + 1) : (i + 1).ToString();
+                str += "\n";
+            }
+            str += "\n\n" + otherInfo + "\n";
+
+            try
+            {
+                string fileName = string.Format("\\分块说明({0}).txt", Path.GetFileNameWithoutExtension(Session.GetSession().Parts.Work.FullPath));
+                StreamWriter sw = new StreamWriter(statDirectory + fileName, false);
+                sw.Write(str);
+                sw.Close();
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex.ToString());
+            }
+        }
+
+        ///同上
+        public static void StatisticsOne(List<NXObject>[] finalObjs, double[] angles, List<Curve>[] holeCurves,
+            string statDirectory, bool isCharName, Body tempBody1, Body tempBody2, string otherInfo,
+            bool compareHole, double tolerance = 1)
+        {
+            Log.Info("统计分块");
+            //造型边数量
+            int[] edgeStat = new int[finalObjs.Length];
+            //造型边长度和
+            double[] edgeLenStat = new double[finalObjs.Length];
+            //所有边
+            List<Edge>[] allEdgeList = new List<Edge>[finalObjs.Length];
+
+            for (int i = 0; i < finalObjs.Length; i++)
+            {
+                edgeStat[i] = 0;
+                edgeLenStat[i] = 0;
+                allEdgeList[i] = new List<Edge>();
+                foreach (NXObject obj in finalObjs[i])
+                {
+                    if (obj == null || !(obj is Body))
+                    {
+                        continue;
+                    }
+                    Edge[] edges = ((Body)obj).GetEdges();
+                    edgeStat[i] += edges.Length;
+                    edgeLenStat[i] += edges.Select(t => t.GetLength()).Sum();
+                    allEdgeList[i].AddRange(edges);
+                }
+            }
+
+            //边与切面的交点数
+            //切面一位于1/2处, 切面二位于1/3处, 切面三位于4/5处
+            int[] inPoints_1 = new int[finalObjs.Length * 5];
+            for (int i = 0; i < finalObjs.Length; i++)
+            {
+                Body body2 = (Body)UGFunc.MoveObjectsByAngle(new NXObject[] { tempBody1 }, -angles[i] / 6, 1)[0];
+                Body body3 = (Body)UGFunc.MoveObjectsByAngle(new NXObject[] { tempBody1 }, angles[i] * 3 / 10, 1)[0];
+                Body body4 = (Body)UGFunc.MoveObjectsByAngle(new NXObject[] { tempBody1 }, angles[i] / 6, 1)[0];
+                Body body5 = (Body)UGFunc.MoveObjectsByAngle(new NXObject[] { tempBody1 }, -angles[i] * 3 / 10, 1)[0];
+                inPoints_1[i * 5 + 0] = UGFunc.GetPointNum(tempBody1, allEdgeList[i].ToArray());
+                inPoints_1[i * 5 + 1] = UGFunc.GetPointNum(body2, allEdgeList[i].ToArray());
+                inPoints_1[i * 5 + 2] = UGFunc.GetPointNum(body3, allEdgeList[i].ToArray());
+                inPoints_1[i * 5 + 3] = UGFunc.GetPointNum(body4, allEdgeList[i].ToArray());
+                inPoints_1[i * 5 + 4] = UGFunc.GetPointNum(body5, allEdgeList[i].ToArray());
+                UGFunc.Delete(new NXObject[] { body2, body3, body4, body5 });
+            }
+
+            int[] inPoints_2 = new int[finalObjs.Length * 5];
+            for (int i = 0; i < finalObjs.Length; i++)
+            {
+                Body body2 = (Body)UGFunc.MoveObjectsByAngle(new NXObject[] { tempBody2 }, -angles[i] / 6, 1)[0];
+                Body body3 = (Body)UGFunc.MoveObjectsByAngle(new NXObject[] { tempBody2 }, angles[i] * 3 / 10, 1)[0];
+                Body body4 = (Body)UGFunc.MoveObjectsByAngle(new NXObject[] { tempBody2 }, angles[i] / 6, 1)[0];
+                Body body5 = (Body)UGFunc.MoveObjectsByAngle(new NXObject[] { tempBody2 }, -angles[i] * 3 / 10, 1)[0];
+                inPoints_2[i * 5 + 0] = UGFunc.GetPointNum(tempBody2, allEdgeList[i].ToArray());
+                inPoints_2[i * 5 + 1] = UGFunc.GetPointNum(body2, allEdgeList[i].ToArray());
+                inPoints_2[i * 5 + 2] = UGFunc.GetPointNum(body3, allEdgeList[i].ToArray());
+                inPoints_2[i * 5 + 3] = UGFunc.GetPointNum(body4, allEdgeList[i].ToArray());
+                inPoints_2[i * 5 + 4] = UGFunc.GetPointNum(body5, allEdgeList[i].ToArray());
+                UGFunc.Delete(new NXObject[] { body2, body3, body4, body5 });
+            }
+
+            int typeNum = 0;
+            //相同的块标记一样的数字
+            int[] flags = new int[finalObjs.Length];
+            判断条件：
+             *1、块的角度
+            * 2、块中包含的边的数量和总长度
+            * 3、随机截面与边的交点的数量
+
+
+            for (int i = 0; i < angles.Length; i++)
+            {
+                if (flags[i] != 0)
+                {
+                    //与之前的某个块是同一种
+                    continue;
+                }
+                //另一种块
+                typeNum += 1;
+                flags[i] = typeNum;
+
+                for (int j = i + 1; j < angles.Length; j++)
+                {
+                    //左边一侧截面判断
+                    if (flags[j] == 0 && angles[j] == angles[i] && inPoints_1[j * 5 + 0] == inPoints_1[i * 5 + 0]
+                        && inPoints_1[j * 5 + 1] == inPoints_1[i * 5 + 1] && inPoints_1[j * 5 + 2] == inPoints_1[i * 5 + 2]
+                        && inPoints_1[j * 5 + 3] == inPoints_1[i * 5 + 3] && inPoints_1[j * 5 + 4] == inPoints_1[i * 5 + 4])
+                    {
+                        //右边一侧截面判断
+                        if (inPoints_2[j * 5 + 0] == inPoints_2[i * 5 + 0]
+                            && inPoints_2[j * 5 + 1] == inPoints_2[i * 5 + 1] && inPoints_2[j * 5 + 2] == inPoints_2[i * 5 + 2]
+                            && inPoints_2[j * 5 + 3] == inPoints_2[i * 5 + 3] && inPoints_2[j * 5 + 4] == inPoints_2[i * 5 + 4])
+                        {
+                            bool holeFlag = true;
+                            if (compareHole)
+                            {
+                                //气孔数判断
+                                if (holeCurves[i].Count == holeCurves[j].Count)
+                                {
+                                    bool equalFlag = true;
+                                    bool breakFlag = false;
+                                    //气孔位置判断
+                                    for (int m = 0; m < holeCurves[i].Count; m++)
+                                    {
+                                        UGFunc.ArcFitting(holeCurves[i][m].Tag, out double[] centerPt_1, out double radius_1);
+                                        breakFlag = false;
+                                        for (int n = 0; n < holeCurves[j].Count; n++)
+                                        {
+                                            UGFunc.ArcFitting(holeCurves[j][n].Tag, out double[] centerPt_2, out double radius_2);
+                                            if (Math.Abs(centerPt_1[0] - centerPt_2[0]) <= 1e-4
+                                                && Math.Abs(centerPt_1[1] - centerPt_2[1]) <= 1e-4
+                                                && Math.Abs(centerPt_1[2] - centerPt_2[2]) <= 1e-4)
+                                            {
+                                                breakFlag = true;
+                                                break;
+                                            }
+                                        }
+                                        if (breakFlag == false)
+                                        {
+                                            equalFlag = false;
+                                            break;
+                                        }
+                                    }
+
+                                    if (equalFlag == false)
+                                    {
+                                        holeFlag = false;
+                                    }
+                                }
+                                else
+                                {
+                                    holeFlag = false;
+                                }
+                            }
+                            if (holeFlag == true)
+                            {
+                                flags[j] = flags[i];
+                            }
+                        }
+                    }
+                }
+            }
+
+            string str = "";
+            str += string.Format("[{0}]\n花纹块共{1}块，分{2}种情况:\n", DateTime.Now, finalObjs.Length, typeNum);
+            for (int i = 1; i <= typeNum; i++)
+            {
+                List<int> no = new List<int>();
+                for (int j = 0; j < flags.Length; j++)
+                {
+                    if (flags[j] == i)
+                    {
+                        no.Add(j);
+                    }
+                }
+                str += string.Join("=", no.Select(t => isCharName ? MathFunc.ConvertDecimalToLetters(t + 1) : (t + 1).ToString()).ToArray());
+                str += System.Environment.NewLine;
+            }
+
+            //补充侧面失败信息
+            str += "\n\n" + otherInfo + "\n";
+            //for (int i = 0; i < 10; i++)
+            //{
+            //    str += System.Environment.NewLine;
+            //}
+            string note = "";
+            note += "以下为调试参考请忽略！\n";
+            note += "编号\t角度\t气孔数\t边\t边长\n";
+            for (int i = 0; i < edgeStat.Length; i++)
+            {
+                note += $"{(isCharName ? MathFunc.ConvertDecimalToLetters(i + 1) : (i + 1).ToString())}\t" +
+                        $"{angles[i]}\t{holeCurves[i].Count}\t{edgeStat[i]}\t{edgeLenStat[i]}\n";
+            }
+            note += "编号\t下切面1\t下切面2\t下切面3\t下切面4\t下切面5\n";
+            for (int i = 0; i < edgeStat.Length; i++)
+            {
+                note += $"{(isCharName ? MathFunc.ConvertDecimalToLetters(i + 1) : (i + 1).ToString())}\t" +
+                        $"{inPoints_1[i * 5 + 0]}\t{inPoints_1[i * 5 + 1]}\t{inPoints_1[i * 5 + 2]}\t" +
+                        $"{inPoints_1[i * 5 + 3]}\t{inPoints_1[i * 5 + 4]}\n";
+            }
+            note += "编号\t上切面1\t上切面2\t上切面3\t上切面4\t上切面5\n";
+            for (int i = 0; i < edgeStat.Length; i++)
+            {
+                note += $"{(isCharName ? MathFunc.ConvertDecimalToLetters(i + 1) : (i + 1).ToString())}\t" +
+                        $"{inPoints_2[i * 5 + 0]}\t{inPoints_2[i * 5 + 1]}\t{inPoints_2[i * 5 + 2]}\t" +
+                        $"{inPoints_2[i * 5 + 3]}\t{inPoints_2[i * 5 + 4]}\n";
+            }
+            Log.Debug(note);
+            try
+            {
+                string fileName = string.Format("\\分块说明({0}).txt", Path.GetFileNameWithoutExtension(Session.GetSession().Parts.Work.FullPath));
+                StreamWriter sw = new StreamWriter(statDirectory + fileName, false);
+                sw.Write(str);
+                sw.Close();
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex.ToString());
+            }
+        }
+
+
+
+        /// <summary>
+        /// 判断两个体是否相交，基于YZ平面的边界盒
+        /// </summary>
+        /// <param name="body_1"></param>
+        /// <param name="body_2"></param>
+        /// <returns></returns>
+        public static bool IsIntersectant(Body body_1, Body body_2)
+        {
+            double[] box1 = UGFunc.GetBoundingBoxExact(body_1);
+            double[] box2 = UGFunc.GetBoundingBoxExact(body_2);
+
+            radius = Math.Abs(box2[5]) > radius ? Math.Abs(box2[5]) : radius;
+            width = Math.Abs(box2[3]) > width ? Math.Abs(box2[3]) : width;
+
+            Polygon polygon_1 = new Polygon(new LinearRing(new Coordinate[] {
+                new Coordinate(box1[4], box1[5]),
+                new Coordinate(box1[1], box1[5]),
+                new Coordinate(box1[1], box1[2]),
+                new Coordinate(box1[4], box1[2]),
+                new Coordinate(box1[4], box1[5])
+            }));
+
+            Polygon polygon_2 = new Polygon(new LinearRing(new Coordinate[] {
+                new Coordinate(box2[4], box2[5]),
+                new Coordinate(box2[1], box2[5]),
+                new Coordinate(box2[1], box2[2]),
+                new Coordinate(box2[4], box2[2]),
+                new Coordinate(box2[4], box2[5])
+            }));
+
+            //Geometry a = polygon_1.Intersection(polygon_2);
+            return polygon_1.Intersects(polygon_2);
+        }
+
+        /// <summary>
+        /// 创建预分块模型
+        /// </summary>
+        /// <param name="list">排序后的分块线组</param>
+        /// <param name="ifReverse">顺、逆时针分块</param>
+        /// <returns>裁块框架实体</returns>
+        public static List<PreSegment> CreatePreSegment(List<CustomLine> customLineList, bool isClockWise)
+        {
+            Log.Info("预创建分块");
+            if (customLineList == null || customLineList.Count == 0)
+            {
+                return new List<PreSegment>(0);
+            }
+
+            List<PreSegment> preSegmentList = new List<PreSegment>();
+            for (int i = 0; i < customLineList.Count; i++)
+            {
+                PreSegment tempSeg = new PreSegment();
+
+                if (i != customLineList.Count - 1)
+                {
+                    tempSeg.StartLine = customLineList[i];
+                    tempSeg.EndLine = customLineList[i + 1];
+                }
+                //生成最后一块，其起始边为分块线组的最后一条直线，结束边为分块线组的起始直线
+                else
+                {
+                    tempSeg.StartLine = customLineList[i];
+                    tempSeg.EndLine = customLineList[0];
+                }
+
+                tempSeg.Name = String.Format("Seg{0}", i + 1);
+                tempSeg.Angle = MathFunc.GetOffsetOf2Angles(tempSeg.StartLine.Angle, tempSeg.EndLine.Angle, isClockWise);
+                tempSeg.Angle = Convert.ToDouble(string.Format("{0:F3}", tempSeg.Angle));
+                tempSeg.IsCreate = false;
+
+                preSegmentList.Add(tempSeg);
+            }
+
+            return preSegmentList;
+        }
+
+        /// <summary>
+        /// 对分块线进行排序，以从起始线按分块方向旋转的角度为排序依据
+        /// </summary>
+        /// <param name="customLineList">分块线组</param>
+        /// <param name="isReverse">分块方向</param>
+        /// <returns></returns>
+        public static List<CustomLine> SortSplitLines(List<CustomLine> customLineList, CustomLine firstCustomLine, bool isClockWise)
+        {
+            Log.Info("排序分块线");
+            if (customLineList == null || customLineList.Count == 0)
+            {
+                return new List<CustomLine>(0);
+            }
+            customLineList = customLineList.OrderBy(t =>
+            {
+                double temp = t.Angle - firstCustomLine.Angle;
+                temp = temp < 0 ? temp + 360 : temp;
+                return temp;
+            }).ToList();
+
+            if (isClockWise)
+            {
+                customLineList.Reverse(1, customLineList.Count - 1);
+            }
+
+            return customLineList;
+        }
+    }
+}
